@@ -17,12 +17,12 @@
 package com.android.tv.settings.system.development;
 
 import android.Manifest;
+import android.adb.ADBRootService;
 import android.app.Activity;
 import android.app.ActivityManager;
 import android.app.AppOpsManager;
 import android.app.admin.DevicePolicyManager;
 import android.app.backup.IBackupManager;
-import android.bluetooth.BluetoothAdapter;
 import android.content.BroadcastReceiver;
 import android.content.ComponentName;
 import android.content.ContentResolver;
@@ -72,7 +72,14 @@ import com.android.settingslib.development.SystemPropPoker;
 import com.android.tv.settings.R;
 import com.android.tv.settings.SettingsPreferenceFragment;
 
+import java.net.NetworkInterface;
+import java.net.InetAddress;
+import java.net.SocketException;
+
+import lineageos.providers.LineageSettings;
+
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashSet;
 import java.util.List;
 
@@ -86,11 +93,13 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
 
     private static final String ENABLE_DEVELOPER = "development_settings_enable";
     private static final String ENABLE_ADB = "enable_adb";
+    private static final String ENABLE_ADB_ROOT = "enable_adb_root";
+    private static final String ADB_TCPIP = "adb_over_network";
     private static final String CLEAR_ADB_KEYS = "clear_adb_keys";
     private static final String ENABLE_TERMINAL = "enable_terminal";
     private static final String KEEP_SCREEN_ON = "keep_screen_on";
     private static final String BT_HCI_SNOOP_LOG = "bt_hci_snoop_log";
-    private static final String BTSNOOP_ENABLE_PROPERTY = "persist.bluetooth.btsnoopenable";
+    private static final String BTSNOOP_LOG_MODE_PROPERTY = "persist.bluetooth.btsnooplogmode";
     private static final String ENABLE_OEM_UNLOCK = "oem_unlock_enable";
     private static final String HDCP_CHECKING_KEY = "hdcp_checking";
     private static final String HDCP_CHECKING_PROPERTY = "persist.sys.hdcp_checking";
@@ -172,13 +181,17 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
     private boolean mLastEnabledState;
     private boolean mHaveDebugSettings;
 
+    private ADBRootService mADBRootService;
+
     private SwitchPreference mEnableDeveloper;
     private SwitchPreference mEnableAdb;
+    private SwitchPreference mAdbOverNetwork;
     private Preference mClearAdbKeys;
+    private SwitchPreference mEnableAdbRoot;
     private SwitchPreference mEnableTerminal;
     private Preference mBugreport;
     private SwitchPreference mKeepScreenOn;
-    private SwitchPreference mBtHciSnoopLog;
+    private ListPreference mBtHciSnoopLog;
     private SwitchPreference mEnableOemUnlock;
     private SwitchPreference mDebugViewAttributes;
     private SwitchPreference mForceAllowOnExternal;
@@ -267,6 +280,8 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
 
         mContentResolver = getActivity().getContentResolver();
 
+        mADBRootService = new ADBRootService();
+
         super.onCreate(icicle);
     }
 
@@ -295,6 +310,8 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         final PreferenceGroup debugDebuggingCategory = (PreferenceGroup)
                 findPreference(DEBUG_DEBUGGING_CATEGORY_KEY);
         mEnableAdb = findAndInitSwitchPref(ENABLE_ADB);
+        mEnableAdbRoot = findAndInitSwitchPref(ENABLE_ADB_ROOT);
+        mAdbOverNetwork = findAndInitSwitchPref(ADB_TCPIP);
         mClearAdbKeys = findPreference(CLEAR_ADB_KEYS);
         if (!AdbProperties.secure().orElse(false)) {
             if (debugDebuggingCategory != null) {
@@ -315,7 +332,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         mLogpersistController.displayPreference(preferenceScreen);
 
         mKeepScreenOn = findAndInitSwitchPref(KEEP_SCREEN_ON);
-        mBtHciSnoopLog = findAndInitSwitchPref(BT_HCI_SNOOP_LOG);
+        mBtHciSnoopLog = addListPreference(BT_HCI_SNOOP_LOG);
         mEnableOemUnlock = findAndInitSwitchPref(ENABLE_OEM_UNLOCK);
         if (!showEnableOemUnlockPreference()) {
             removePreference(mEnableOemUnlock);
@@ -335,6 +352,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         if (!mUm.isAdminUser()) {
             disableForUser(mEnableAdb);
             disableForUser(mClearAdbKeys);
+            disableForUser(mEnableAdbRoot);
             disableForUser(mEnableTerminal);
             disableForUser(mPassword);
         }
@@ -588,6 +606,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         mHaveDebugSettings = false;
         updateSwitchPreference(mEnableAdb, Settings.Global.getInt(cr,
                 Settings.Global.ADB_ENABLED, 0) != 0);
+        updateSwitchPreference(mEnableAdbRoot, mADBRootService.getEnabled());
         if (mEnableTerminal != null) {
             updateSwitchPreference(mEnableTerminal,
                     context.getPackageManager().getApplicationEnabledSetting(TERMINAL_APP_PACKAGE)
@@ -595,8 +614,6 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         }
         updateSwitchPreference(mKeepScreenOn, Settings.Global.getInt(cr,
                 Settings.Global.STAY_ON_WHILE_PLUGGED_IN, 0) != 0);
-        updateSwitchPreference(mBtHciSnoopLog,
-                SystemProperties.getBoolean(BTSNOOP_ENABLE_PROPERTY, false));
         if (mEnableOemUnlock != null) {
             updateSwitchPreference(mEnableOemUnlock, isOemUnlockEnabled(getActivity()));
             mEnableOemUnlock.setEnabled(isOemUnlockAllowed());
@@ -605,6 +622,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
                 Settings.Global.DEBUG_VIEW_ATTRIBUTES, 0) != 0);
         updateSwitchPreference(mForceAllowOnExternal, Settings.Global.getInt(cr,
                 Settings.Global.FORCE_ALLOW_ON_EXTERNAL, 0) != 0);
+        updateBluetoothHciSnoopLogValues();
         updateHdcpValues();
         updatePasswordSummary();
         updateDebuggerOptions();
@@ -637,6 +655,40 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         updateSimulateColorSpace();
         updateUSBAudioOptions();
         updateForceResizableOptions();
+        updateAdbOverNetwork();
+    }
+
+    private void updateAdbOverNetwork() {
+        int port = LineageSettings.Secure.getInt(getActivity().getContentResolver(),
+                LineageSettings.Secure.ADB_PORT, 0);
+        boolean enabled = port > 0;
+
+        updateSwitchPreference(mAdbOverNetwork, enabled);
+
+        String hostAddress = null;
+
+        if (enabled) {
+            try {
+                List<NetworkInterface> interfaces = Collections.list(
+                        NetworkInterface.getNetworkInterfaces());
+                for (NetworkInterface intf : interfaces) {
+                    List<InetAddress> addrs = Collections.list(intf.getInetAddresses());
+                    for (InetAddress addr : addrs) {
+                        if (!addr.isLoopbackAddress() &&
+                            addr.getHostAddress().indexOf(':') < 0) {
+                            hostAddress = addr.getHostAddress();
+                            break;
+                        }
+                    }
+                }
+	    } catch (SocketException se) {};
+        }
+
+        if (hostAddress != null) {
+            mAdbOverNetwork.setSummary(hostAddress + ":" + String.valueOf(port));
+        } else {
+            mAdbOverNetwork.setSummary(R.string.adb_over_network_summary);
+        }
     }
 
     private void resetDangerousOptions() {
@@ -648,6 +700,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
             }
         }
         resetDebuggerOptions();
+        resetAdbNotifyOptions();
         mLogpersistController.writeLogpersistOption(null, true);
         mLogdSizeController.writeLogdSizeOption(null);
         writeAnimationScaleOption(0, mWindowAnimationScale, null);
@@ -665,6 +718,35 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         SystemPropPoker.getInstance().poke();
     }
 
+    private void resetAdbNotifyOptions() {
+        LineageSettings.Secure.putInt(getActivity().getContentResolver(),
+                LineageSettings.Secure.ADB_NOTIFY, 1);
+    }
+
+    private void updateBluetoothHciSnoopLogValues() {
+        ListPreference bluetoothSnoopLog = (ListPreference) findPreference(BT_HCI_SNOOP_LOG);
+        if (bluetoothSnoopLog != null) {
+            String currentValue = SystemProperties.get(BTSNOOP_LOG_MODE_PROPERTY);
+            String[] values = getResources().getStringArray(R.array.bt_hci_snoop_log_values);
+            String[] summaries = getResources().getStringArray(R.array.bt_hci_snoop_log_entries);
+            int disabledIndex = 0; // defaults to DISABLED
+            updateListPreference(bluetoothSnoopLog, currentValue, values, summaries, disabledIndex);
+        }
+    }
+
+    private void updateListPreference(ListPreference preference, String currentValue,
+            String[] values, String[] summaries, int index) {
+        for (int i = 0; i < values.length; i++) {
+            if (currentValue.equals(values[i])) {
+                index = i;
+                break;
+            }
+        }
+        preference.setValue(values[index]);
+        preference.setSummary(summaries[index]);
+        preference.setOnPreferenceChangeListener(this);
+    }
+
     private void updateHdcpValues() {
         ListPreference hdcpChecking = (ListPreference) findPreference(HDCP_CHECKING_KEY);
         if (hdcpChecking != null) {
@@ -672,15 +754,7 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
             String[] values = getResources().getStringArray(R.array.hdcp_checking_values);
             String[] summaries = getResources().getStringArray(R.array.hdcp_checking_summaries);
             int index = 1; // Defaults to drm-only. Needs to match with R.array.hdcp_checking_values
-            for (int i = 0; i < values.length; i++) {
-                if (currentValue.equals(values[i])) {
-                    index = i;
-                    break;
-                }
-            }
-            hdcpChecking.setValue(values[index]);
-            hdcpChecking.setSummary(summaries[index]);
-            hdcpChecking.setOnPreferenceChangeListener(this);
+            updateListPreference(hdcpChecking, currentValue, values, summaries, index);
         }
     }
 
@@ -696,10 +770,11 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
         }
     }
 
-    private void writeBtHciSnoopLogOptions() {
-        BluetoothAdapter adapter = BluetoothAdapter.getDefaultAdapter();
-        SystemProperties.set(BTSNOOP_ENABLE_PROPERTY,
-                Boolean.toString(mBtHciSnoopLog.isChecked()));
+    private void writeBtHciSnoopLogOptions(Object newValue) {
+        SystemProperties.set(BTSNOOP_LOG_MODE_PROPERTY,
+                newValue == null ? "" : newValue.toString());
+        updateBluetoothHciSnoopLogValues();
+        SystemPropPoker.getInstance().poke();
     }
 
     private void writeDebuggerOptions() {
@@ -1469,6 +1544,17 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
                 mVerifyAppsOverUsb.setEnabled(false);
                 mVerifyAppsOverUsb.setChecked(false);
             }
+        } else if (preference == mEnableAdbRoot) {
+            mADBRootService.setEnabled(mEnableAdbRoot.isChecked());
+        } else if (preference == mAdbOverNetwork) {
+            if (mAdbOverNetwork.isChecked()) {
+                LineageSettings.Secure.putInt(getActivity().getContentResolver(),
+                        LineageSettings.Secure.ADB_PORT, 5555);
+            } else {
+                LineageSettings.Secure.putInt(getActivity().getContentResolver(),
+                        LineageSettings.Secure.ADB_PORT, -1);
+            }
+            updateAdbOverNetwork();
         } else if (preference == mEnableTerminal) {
             final PackageManager pm = getActivity().getPackageManager();
             pm.setApplicationEnabledSetting(TERMINAL_APP_PACKAGE,
@@ -1479,8 +1565,6 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
                     mKeepScreenOn.isChecked() ?
                             (BatteryManager.BATTERY_PLUGGED_AC | BatteryManager.BATTERY_PLUGGED_USB)
                             : 0);
-        } else if (preference == mBtHciSnoopLog) {
-            writeBtHciSnoopLogOptions();
         } else if (preference == mEnableOemUnlock) {
             if (mEnableOemUnlock.isChecked()) {
                 // Pass to super to launch the dialog, then uncheck until the dialog
@@ -1589,6 +1673,9 @@ public class DevelopmentFragment extends SettingsPreferenceFragment
             return true;
         } else if (preference == mSimulateColorSpace) {
             writeSimulateColorSpace(newValue);
+            return true;
+        } else if (preference == mBtHciSnoopLog) {
+            writeBtHciSnoopLogOptions(newValue);
             return true;
         }
         return false;
